@@ -1,6 +1,25 @@
 /*
- * This file is part of VoltDB.
+ * The MIT License (MIT)
+ *
  * Copyright (C) 2008-2016 VoltDB Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
  */
 
 package org.voltdb.exportclient;
@@ -44,7 +63,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
 
     String m_streamName = null;
     AmazonKinesisFirehoseClient m_firehoseClient = null;
-    boolean m_skipInternal;
+    boolean m_skipInternals;
     ExportDecoderBase.BinaryEncoding m_binaryEncoding;
     char m_seperator;
     // use thread-local to avoid SimpleDateFormat thread-safety issues
@@ -76,7 +95,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                 new BasicAWSCredentials(accessKey, secretKey));
         m_firehoseClient.setRegion(region);
 
-        m_skipInternal = Boolean.parseBoolean(config.getProperty("skipinternals", "false"));
+        m_skipInternals = Boolean.parseBoolean(config.getProperty("skipinternals", "false"));
 
         final TimeZone tz = TimeZone.getTimeZone(config.getProperty("timezone", VoltDB.GMT_TIMEZONE.getID()));
         m_ODBCDateformat = new ThreadLocal<SimpleDateFormat>() {
@@ -103,7 +122,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
 
         validateStream();
         // Kinesis firehose limits record size to 1,000 KB
-        setRowLengthLimit(1000000);
+        setRowLengthLimit(1000000, m_skipInternals);
     }
 
     private void validateStream() throws Exception {
@@ -164,7 +183,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
             Record record = new Record();
             try {
                 final ExportRowData row = decodeRow(rowData);
-                if (!writeRow(row.values, csv, m_skipInternal, m_binaryEncoding, m_ODBCDateformat.get())) {
+                if (!writeRow(row.values, csv, m_skipInternals, m_binaryEncoding, m_ODBCDateformat.get())) {
                     return false;
                 }
                 csv.flush();
