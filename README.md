@@ -2,7 +2,7 @@
 
 An experimental VoltDB to Kinesis Firehose export conduit [Kinesis Firehose API]
 (http://docs.aws.amazon.com/firehose/latest/dev/what-is-this-service.html). It
-allows export stream writers to push data directly into correspoding Kinesis Firehose streams.
+allows export stream writers to push data directly into corresponding Kinesis Firehose streams.
 
 Keep in mind that Kinesis Firehose streams are relatively narrow when compared to VoltDB's
 throughput, and is only capable of handling 5,000 rows per second so for heavy export workloads
