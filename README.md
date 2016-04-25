@@ -95,7 +95,4 @@ INSERT INTO ALERTS (ID,MSG,CONTINENT,COUNTRY) VALUES (1,'fab-02 inoperable','EU'
 - `stream.name`  (mandatory) Kinesis Firehose stream name
 - `access.key` (mandatory) user's access key
 - `secret.key` (mandatory) user's secret key
-- `skipinternals` (optional, _default:_ false) flag to skip adding internal metadata to each row
 - `timezone` (optional, _default:_ local timezone) timezone used to format timestamp values
-- `binaryencoding` (optional, _default:_ hex) Specifies whether VARBINARY data is encoded in hexadecimal or BASE64 format.
-- `type` (optional, _default:_ csv) specifies whether export format is csv or tsv.
