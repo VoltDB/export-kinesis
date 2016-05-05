@@ -88,9 +88,6 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         }
 
         m_timeZone = TimeZone.getTimeZone(config.getProperty("timezone", VoltDB.REAL_DEFAULT_TIMEZONE.getID()));
-
-        // Kinesis firehose limits record size to 1,000 KB
-        setRowLengthLimit(1000000, true);
     }
 
     @Override
