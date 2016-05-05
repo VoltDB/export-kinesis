@@ -63,7 +63,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
     private String m_accessKey;
     private String m_secretKey;
     private TimeZone m_timeZone;
-    public static final String ROW_LENGTH_LIMIT = "rowlengthlimit";
+    public static final String ROW_LENGTH_LIMIT = "row.length.limit";
 
     @Override
     public void configure(Properties config) throws Exception
