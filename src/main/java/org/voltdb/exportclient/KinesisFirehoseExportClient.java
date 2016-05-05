@@ -63,6 +63,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
     private String m_accessKey;
     private String m_secretKey;
     private TimeZone m_timeZone;
+    public static final String ROW_LENGTH_LIMIT = "rowlengthlimit";
 
     @Override
     public void configure(Properties config) throws Exception
@@ -88,6 +89,9 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         }
 
         m_timeZone = TimeZone.getTimeZone(config.getProperty("timezone", VoltDB.REAL_DEFAULT_TIMEZONE.getID()));
+
+        config.setProperty(ROW_LENGTH_LIMIT,
+                config.getProperty(ROW_LENGTH_LIMIT,"1_000_000"));
     }
 
     @Override
