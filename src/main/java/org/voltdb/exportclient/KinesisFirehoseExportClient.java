@@ -26,9 +26,11 @@ package org.voltdb.exportclient;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
+import java.nio.charset.StandardCharsets;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Properties;
+import java.util.Queue;
 import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
 
@@ -105,8 +107,13 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         private final CSVStringDecoder m_decoder;
 
         private boolean m_primed = false;
-        private ArrayList<Record> m_records;
+        private Queue<List<Record>> m_records;
+        private List<Record> currentBatch;
+        private int m_currentBatchSize;
         private AmazonKinesisFirehoseClient m_firehoseClient;
+
+        public static final int BATCH_NUMBER_LIMIT = 500;
+        public static final int BATCH_SIZE_LIMIT = 4*1024*1024;
 
         @Override
         public ListeningExecutorService getExecutor() {
@@ -138,10 +145,10 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
             String status = "UNDEFINED";
             describeHoseResult = m_firehoseClient.describeDeliveryStream(describeHoseRequest);
             status = describeHoseResult.getDeliveryStreamDescription().getDeliveryStreamStatus();
-            if(status.equalsIgnoreCase("ACTIVE")){
+            if("ACTIVE".equalsIgnoreCase(status)){
                 return;
             }
-            else if(status.equalsIgnoreCase("CREATING")){
+            else if("CREATING".equalsIgnoreCase(status)){
                 Thread.sleep(5000);
                 validateStream();
             }
@@ -165,20 +172,27 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         }
 
         @Override
-        public boolean processRow(int rowSize, byte[] rowData) throws RestartBlockException
-        {
+        public boolean processRow(int rowSize, byte[] rowData) throws RestartBlockException {
             if (!m_primed) checkOnFirstRow();
             Record record = new Record();
             try {
                 final ExportRowData rd = decodeRow(rowData);
                 String decoded = m_decoder.decode(null, rd.values);
-                record.withData(ByteBuffer.wrap(decoded.getBytes()));
+                record.withData(ByteBuffer.wrap(decoded.getBytes(StandardCharsets.UTF_8)));
             } catch(IOException e) {
                 LOG.error("Failed to build record", e);
                 throw new RestartBlockException("Failed to build record", e, true);
             }
-
-            m_records.add(record);
+            // PutRecordBatchRequest can not contain more than 500 records
+            // And up to a limit of 4 MB for the entire request
+            if (((m_currentBatchSize + rowSize) > BATCH_SIZE_LIMIT) || (currentBatch.size() >= BATCH_NUMBER_LIMIT)) {
+                // roll to next batch
+                m_records.add(currentBatch);
+                m_currentBatchSize = 0;
+                currentBatch = new LinkedList<Record>();
+            }
+            currentBatch.add(record);
+            m_currentBatchSize += rowSize;
             return true;
         }
 
@@ -198,25 +212,29 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         public void onBlockStart() throws RestartBlockException
         {
             if (!m_primed) checkOnFirstRow();
-            m_records = new ArrayList<Record>();
+            m_records = new LinkedList<List<Record>>();
+            m_currentBatchSize = 0;
+            currentBatch = new LinkedList<Record>();
         }
 
         @Override
         public void onBlockCompletion() throws RestartBlockException
         {
+            // add last batch
+            if (!currentBatch.isEmpty()) {
+                // roll to next batch
+                m_records.add(currentBatch);
+                m_currentBatchSize = 0;
+                currentBatch = new LinkedList<Record>();
+            }
             try {
-                final int recordsSize = m_records.size();
-
                 List<Record> recordsList;
-                int rowTracker = 0;
                 int sleepTime = 0;
 
-                while (recordsSize > rowTracker) {
+                while (!m_records.isEmpty()) {
                     if (sleepTime > 0)
                         Thread.sleep(sleepTime);
-                    // PutRecordBatchRequest can not contain more than 500 records
-                    recordsList = m_records.subList(rowTracker,
-                            rowTracker = (recordsSize > rowTracker + 500) ? rowTracker + 500 : recordsSize);
+                    recordsList = m_records.poll();
                     PutRecordBatchRequest batchRequest = new PutRecordBatchRequest().
                             withDeliveryStreamName(m_streamName).
                             withRecords(recordsList);
@@ -228,10 +246,10 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                                 throw new RestartBlockException(true);
                             }
                         }
-                        rowTracker -= recordsList.size();
                         sleepTime = sleepTime == 0 ? 1000 : sleepTime*2;
-                    } else
+                    } else {
                         sleepTime = sleepTime == 0 ? 0 : sleepTime-10;
+                    }
                 }
             } catch (ResourceNotFoundException | InvalidArgumentException | ServiceUnavailableException | InterruptedException e) {
                 LOG.error("Failed to send record batch", e);
