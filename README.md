@@ -18,10 +18,10 @@ On a Mac if you have [Homebrew](http://brew.sh/) setup then simply install the g
 brew install gradle
 ```
 
-On Linux setup [GVM](http://gvmtool.net/), and install gradle as follows
+On Linux setup [SDK](http://sdkman.io/), and install gradle as follows
 
 ```bash
-gvm install gradle
+sdk install gradle
 ```
 
 * Create `gradle.properties` file and set the `voltdbhome` property
