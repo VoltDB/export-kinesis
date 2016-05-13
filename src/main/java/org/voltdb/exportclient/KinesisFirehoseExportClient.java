@@ -65,7 +65,9 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
     private String m_accessKey;
     private String m_secretKey;
     private TimeZone m_timeZone;
+    private String m_recordSeparator;
     public static final String ROW_LENGTH_LIMIT = "row.length.limit";
+    public static final String RECORD_SEPARATOR = "record.separator";
 
     @Override
     public void configure(Properties config) throws Exception
@@ -92,8 +94,11 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
 
         m_timeZone = TimeZone.getTimeZone(config.getProperty("timezone", VoltDB.REAL_DEFAULT_TIMEZONE.getID()));
 
+
+        m_recordSeparator = config.getProperty(RECORD_SEPARATOR,"\n");
+
         config.setProperty(ROW_LENGTH_LIMIT,
-                config.getProperty(ROW_LENGTH_LIMIT,"1000000"));
+                config.getProperty(ROW_LENGTH_LIMIT,Integer.toString(1024000 - m_recordSeparator.length())));
     }
 
     @Override
@@ -177,7 +182,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
             Record record = new Record();
             try {
                 final ExportRowData rd = decodeRow(rowData);
-                String decoded = m_decoder.decode(null, rd.values);
+                String decoded = m_decoder.decode(null, rd.values) + m_recordSeparator; // add a record separator ;
                 record.withData(ByteBuffer.wrap(decoded.getBytes(StandardCharsets.UTF_8)));
             } catch(IOException e) {
                 LOG.error("Failed to build record", e);
