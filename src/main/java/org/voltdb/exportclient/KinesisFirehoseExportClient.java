@@ -94,10 +94,11 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
 
         m_timeZone = TimeZone.getTimeZone(config.getProperty("timezone", VoltDB.REAL_DEFAULT_TIMEZONE.getID()));
 
-        config.setProperty(ROW_LENGTH_LIMIT,
-                config.getProperty(ROW_LENGTH_LIMIT,"1024000"));
 
         m_recordSeparator = config.getProperty(RECORD_SEPARATOR,"\n");
+
+        config.setProperty(ROW_LENGTH_LIMIT,
+                config.getProperty(ROW_LENGTH_LIMIT,Integer.toString(1024000 - m_recordSeparator.length())));
     }
 
     @Override
