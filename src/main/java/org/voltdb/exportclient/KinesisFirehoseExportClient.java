@@ -33,6 +33,7 @@ import java.util.Properties;
 import java.util.Queue;
 import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.voltcore.utils.CoreUtils;
 import org.voltdb.VoltDB;
@@ -117,6 +118,13 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         private int m_currentBatchSize;
         private AmazonKinesisFirehoseClient m_firehoseClient;
         private boolean allowBackPressure;
+        private final AtomicInteger m_backpressureIndication = new AtomicInteger(0);
+
+        // minimal interval between each putRecordsBatch api call;
+        // based on the limit
+        // for small records (row length < 1KB): records/s is the bottleneck
+        // for large records (row length > 1KB): data throughput is the bottleneck
+        private int minSleepTime = 10; // tuned base on orignal limit + small record workload
 
         public static final int BATCH_NUMBER_LIMIT = 500;
         public static final int BATCH_SIZE_LIMIT = 4*1024*1024;
@@ -142,7 +150,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                     + " table " + source.tableName
                     + " generation " + source.m_generation, CoreUtils.MEDIUM_STACK_SIZE);
             m_decoder = builder.build();
-            allowBackPressure = false;
+            allowBackPressure = true;
         }
 
         private void validateStream() throws RestartBlockException, InterruptedException {
@@ -225,8 +233,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         }
 
         @Override
-        public void onBlockCompletion() throws RestartBlockException
-        {
+        public void onBlockCompletion() throws RestartBlockException {
             // add last batch
             if (!currentBatch.isEmpty()) {
                 // roll to next batch
@@ -236,31 +243,64 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
             }
             try {
                 List<Record> recordsList;
-                int sleepTime = 0;
-
                 while (!m_records.isEmpty()) {
-                    if (sleepTime > 0 && allowBackPressure)
-                        Thread.sleep(sleepTime);
                     recordsList = m_records.poll();
-                    PutRecordBatchRequest batchRequest = new PutRecordBatchRequest().
-                            withDeliveryStreamName(m_streamName).
-                            withRecords(recordsList);
-                    PutRecordBatchResult res = m_firehoseClient.putRecordBatch(batchRequest);
-                    if (res.getFailedPutCount() > 0) {
-                        for (PutRecordBatchResponseEntry entry : res.getRequestResponses()) {
-                            if (entry.getErrorMessage() != null && !entry.getErrorMessage().contains("Slow down.")) {
-                                LOG.error("Record failed with response: %s", entry.getErrorMessage());
-                                throw new RestartBlockException(true);
+                    PutRecordBatchRequest batchRequest = new PutRecordBatchRequest().withDeliveryStreamName(
+                            m_streamName).withRecords(recordsList);
+                    int trial = 3;
+                    boolean retry = true;
+                    while (trial > 0 && retry) {
+                        applyBackPressure(allowBackPressure);
+                        PutRecordBatchResult res = m_firehoseClient.putRecordBatch(batchRequest);
+                        if (res.getFailedPutCount() > 0) {
+                            for (PutRecordBatchResponseEntry entry : res.getRequestResponses()) {
+                                if (entry.getErrorMessage() != null) {
+                                    LOG.error("Record failed with response: %s, Error Code: %s. Backpressure: %d.", entry.getErrorMessage(), entry.getErrorCode(), m_backpressureIndication.get());
+                                    if (!entry.getErrorCode().equals("ServiceUnavailableException")) {
+                                        throw new RestartBlockException(true);
+                                    }
+                                }
                             }
+                            setBackPressure(true);
+                        } else {
+                            retry = false;
+                            setBackPressure(false);
                         }
-                        sleepTime = sleepTime == 0 ? 1000 : sleepTime*2;
-                    } else {
-                        sleepTime = sleepTime == 0 ? 0 : sleepTime-10;
+                        trial--;
+                    }
+
+                    if (trial == 0 && retry) {
+                        throw new RestartBlockException(true);
                     }
                 }
-            } catch (ResourceNotFoundException | InvalidArgumentException | ServiceUnavailableException | InterruptedException e) {
+            } catch (ResourceNotFoundException | InvalidArgumentException | ServiceUnavailableException e) {
                 LOG.error("Failed to send record batch", e);
                 throw new RestartBlockException("Failed to send record batch", e, true);
+            }
+        }
+
+        private void setBackPressure(final boolean b) {
+            int prev = m_backpressureIndication.get();
+            int delta = b ? 1 : -(prev > 1 ? prev >> 1 : 1);
+            int next = prev + delta;
+            while (next >= 0 && next <= 9 && !m_backpressureIndication.compareAndSet(prev, next)) {
+                prev = m_backpressureIndication.get();
+                delta = b ? 1 : -(prev > 1 ? prev >> 1 : 1);
+                next = prev + delta;
+            }
+        }
+
+        private void applyBackPressure(final boolean allowBackPressure) {
+            if (!allowBackPressure) {
+                return;
+            }
+            final int count = m_backpressureIndication.get();
+            int sleepTime = minSleepTime + Math.min(1 << 9, 1 << count);
+            LOG.error("Sleep for back pressure for %d ms", sleepTime);
+            try {
+                Thread.sleep(sleepTime);
+            } catch (InterruptedException e) {
+                LOG.debug("Sleep for back pressure interrupted", e);
             }
         }
     }
