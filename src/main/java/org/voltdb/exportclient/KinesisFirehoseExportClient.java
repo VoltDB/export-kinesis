@@ -116,6 +116,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         private List<Record> currentBatch;
         private int m_currentBatchSize;
         private AmazonKinesisFirehoseClient m_firehoseClient;
+        private boolean allowBackPressure;
 
         public static final int BATCH_NUMBER_LIMIT = 500;
         public static final int BATCH_SIZE_LIMIT = 4*1024*1024;
@@ -141,6 +142,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                     + " table " + source.tableName
                     + " generation " + source.m_generation, CoreUtils.MEDIUM_STACK_SIZE);
             m_decoder = builder.build();
+            allowBackPressure = false;
         }
 
         private void validateStream() throws RestartBlockException, InterruptedException {
@@ -237,7 +239,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                 int sleepTime = 0;
 
                 while (!m_records.isEmpty()) {
-                    if (sleepTime > 0)
+                    if (sleepTime > 0 && allowBackPressure)
                         Thread.sleep(sleepTime);
                     recordsList = m_records.poll();
                     PutRecordBatchRequest batchRequest = new PutRecordBatchRequest().
