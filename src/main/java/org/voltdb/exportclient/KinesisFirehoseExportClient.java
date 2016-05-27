@@ -255,6 +255,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                         applyBackPressure(allowBackPressure);
                         PutRecordBatchResult res = m_firehoseClient.putRecordBatch(batchRequest);
                         if (res.getFailedPutCount() > 0) {
+                            int i = 0;
                             for (PutRecordBatchResponseEntry entry : res.getRequestResponses()) {
                                 if (entry.getErrorMessage() != null) {
                                     LOG.error("Record failed with response: %s, Error Code: %s. Low: %d, High: %d.", entry.getErrorMessage(), entry.getErrorCode(),
@@ -262,9 +263,14 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                                     if (!entry.getErrorCode().equals("ServiceUnavailableException")) {
                                         throw new RestartBlockException(true);
                                     }
+                                } else {
+                                 recordsList.remove(i);
                                 }
+                                i++;
                             }
                             setBackPressure(true);
+                            batchRequest = new PutRecordBatchRequest().withDeliveryStreamName(
+                                    m_streamName).withRecords(recordsList);
                         } else {
                             retry = false;
                             setBackPressure(false);
