@@ -33,7 +33,6 @@ import java.util.Properties;
 import java.util.Queue;
 import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import org.voltcore.utils.CoreUtils;
 import org.voltdb.VoltDB;
@@ -118,13 +117,16 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         private int m_currentBatchSize;
         private AmazonKinesisFirehoseClient m_firehoseClient;
         private boolean allowBackPressure;
-        private final AtomicInteger m_backpressureIndication = new AtomicInteger(0);
 
         // minimal interval between each putRecordsBatch api call;
         // based on the limit
         // for small records (row length < 1KB): records/s is the bottleneck
         // for large records (row length > 1KB): data throughput is the bottleneck
-        private int minSleepTime = 10; // tuned base on orignal limit + small record workload
+        private int lowWaterMark = 50; // tuned base on orignal limit + small record workload        ;
+        private int highWaterMark = 150;
+        final private int maxSleepTime = 1000;
+        final private int incInterval = 100;
+        final private int decInterval = 10;
 
         public static final int BATCH_NUMBER_LIMIT = 500;
         public static final int BATCH_SIZE_LIMIT = 4*1024*1024;
@@ -255,7 +257,8 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                         if (res.getFailedPutCount() > 0) {
                             for (PutRecordBatchResponseEntry entry : res.getRequestResponses()) {
                                 if (entry.getErrorMessage() != null) {
-                                    LOG.error("Record failed with response: %s, Error Code: %s. Backpressure: %d.", entry.getErrorMessage(), entry.getErrorCode(), m_backpressureIndication.get());
+                                    LOG.error("Record failed with response: %s, Error Code: %s. Low: %d, High: %d.", entry.getErrorMessage(), entry.getErrorCode(),
+                                               lowWaterMark, highWaterMark);
                                     if (!entry.getErrorCode().equals("ServiceUnavailableException")) {
                                         throw new RestartBlockException(true);
                                     }
@@ -280,13 +283,14 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         }
 
         private void setBackPressure(final boolean b) {
-            int prev = m_backpressureIndication.get();
-            int delta = b ? 1 : -(prev > 1 ? prev >> 1 : 1);
-            int next = prev + delta;
-            while (next >= 0 && next <= 9 && !m_backpressureIndication.compareAndSet(prev, next)) {
-                prev = m_backpressureIndication.get();
-                delta = b ? 1 : -(prev > 1 ? prev >> 1 : 1);
-                next = prev + delta;
+            if (b) {
+                // current highWaterMark still exceeding rate limit
+                int tmp = lowWaterMark + incInterval;
+                lowWaterMark = highWaterMark;
+                highWaterMark = Math.min(tmp, maxSleepTime);
+            } else {
+                lowWaterMark = Math.max(0, lowWaterMark-decInterval);
+                highWaterMark = Math.max(lowWaterMark+ decInterval, (lowWaterMark+highWaterMark)/2);
             }
         }
 
@@ -294,11 +298,9 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
             if (!allowBackPressure) {
                 return;
             }
-            final int count = m_backpressureIndication.get();
-            int sleepTime = minSleepTime + Math.min(1 << 9, 1 << count);
-            LOG.error("Sleep for back pressure for %d ms", sleepTime);
+            LOG.error("Sleep for back pressure for %d ms", highWaterMark);
             try {
-                Thread.sleep(sleepTime);
+                Thread.sleep(highWaterMark);
             } catch (InterruptedException e) {
                 LOG.debug("Sleep for back pressure interrupted", e);
             }
