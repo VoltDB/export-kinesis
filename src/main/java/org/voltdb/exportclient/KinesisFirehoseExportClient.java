@@ -31,6 +31,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Properties;
 import java.util.Queue;
+import java.util.Random;
 import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
 
@@ -122,6 +123,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         // based on the limit
         // for small records (row length < 1KB): records/s is the bottleneck
         // for large records (row length > 1KB): data throughput is the bottleneck
+
         private int lowWaterMark = 50; // tuned base on orignal limit + small record workload        ;
         private int highWaterMark = 150;
         final private int maxSleepTime = 1000;
@@ -153,6 +155,8 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                     + " generation " + source.m_generation, CoreUtils.MEDIUM_STACK_SIZE);
             m_decoder = builder.build();
             allowBackPressure = true;
+            Random random = new Random();
+            highWaterMark += random.nextInt(50); // primed each export step each other
         }
 
         private void validateStream() throws RestartBlockException, InterruptedException {
