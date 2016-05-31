@@ -34,6 +34,7 @@ import java.util.Queue;
 import java.util.Random;
 import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.voltcore.utils.CoreUtils;
 import org.voltdb.VoltDB;
@@ -67,8 +68,14 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
     private String m_secretKey;
     private TimeZone m_timeZone;
     private String m_recordSeparator;
+    private int m_backOffCap;
+    private int m_backOffBase;
+    private final AtomicInteger m_backpressureIndication = new AtomicInteger(0);
+
     public static final String ROW_LENGTH_LIMIT = "row.length.limit";
     public static final String RECORD_SEPARATOR = "record.separator";
+    public static final String BACKOFF_CAP = "backoff.cap.exponent";
+    public static final String BACKOFF_BASE = "backoff.base";
 
     @Override
     public void configure(Properties config) throws Exception
@@ -100,6 +107,9 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
 
         config.setProperty(ROW_LENGTH_LIMIT,
                 config.getProperty(ROW_LENGTH_LIMIT,Integer.toString(1024000 - m_recordSeparator.length())));
+
+        m_backOffCap = Integer.parseInt(config.getProperty(BACKOFF_CAP,"1000"));
+        m_backOffBase = Integer.parseInt(config.getProperty(BACKOFF_BASE,"64"));
     }
 
     @Override
@@ -123,13 +133,13 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         // based on the limit
         // for small records (row length < 1KB): records/s is the bottleneck
         // for large records (row length > 1KB): data throughput is the bottleneck
-
+        /*
         private int lowWaterMark = 50; // tuned base on orignal limit + small record workload        ;
         private int highWaterMark = 150;
         final private int maxSleepTime = 1000;
         final private int incInterval = 100;
         final private int decInterval = 10;
-
+         */
         public static final int BATCH_NUMBER_LIMIT = 500;
         public static final int BATCH_SIZE_LIMIT = 4*1024*1024;
 
@@ -155,8 +165,6 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                     + " generation " + source.m_generation, CoreUtils.MEDIUM_STACK_SIZE);
             m_decoder = builder.build();
             allowBackPressure = true;
-            Random random = new Random();
-            highWaterMark += random.nextInt(50); // primed each export step each other
         }
 
         private void validateStream() throws RestartBlockException, InterruptedException {
@@ -249,6 +257,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
             }
             try {
                 List<Record> recordsList;
+                BackOff backOff = new ExpoBackOffFullJitter(m_backOffBase, m_backOffCap);
                 while (!m_records.isEmpty()) {
                     recordsList = m_records.poll();
                     PutRecordBatchRequest batchRequest = new PutRecordBatchRequest().withDeliveryStreamName(
@@ -256,21 +265,20 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                     int trial = 3;
                     boolean retry = true;
                     while (trial > 0 && retry) {
-                        applyBackPressure(allowBackPressure);
+                        applyBackPressure(allowBackPressure, backOff);
                         PutRecordBatchResult res = m_firehoseClient.putRecordBatch(batchRequest);
                         if (res.getFailedPutCount() > 0) {
                             int i = 0;
                             for (PutRecordBatchResponseEntry entry : res.getRequestResponses()) {
                                 if (entry.getErrorMessage() != null) {
-                                    LOG.error("Record failed with response: %s, Error Code: %s. Low: %d, High: %d.", entry.getErrorMessage(), entry.getErrorCode(),
-                                               lowWaterMark, highWaterMark);
+                                    LOG.warn("Record failed with response: %s, Error Code: %s. ", entry.getErrorMessage(), entry.getErrorCode());
                                     if (!entry.getErrorCode().equals("ServiceUnavailableException")) {
                                         throw new RestartBlockException(true);
                                     }
+                                    i++;
                                 } else {
-                                 recordsList.remove(i);
+                                    recordsList.remove(i);
                                 }
-                                i++;
                             }
                             setBackPressure(true);
                             batchRequest = new PutRecordBatchRequest().withDeliveryStreamName(
@@ -292,28 +300,73 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
             }
         }
 
-        private void setBackPressure(final boolean b) {
-            if (b) {
-                // current highWaterMark still exceeding rate limit
-                int tmp = lowWaterMark + incInterval;
-                lowWaterMark = highWaterMark;
-                highWaterMark = Math.min(tmp, maxSleepTime);
-            } else {
-                lowWaterMark = Math.max(0, lowWaterMark-decInterval);
-                highWaterMark = Math.max(lowWaterMark+ decInterval, (lowWaterMark+highWaterMark)/2);
+        private boolean setBackPressure(boolean b) {
+            int prev = m_backpressureIndication.get();
+            int delta = b ? 1 : -(prev > 1 ? prev >> 1 : 1);
+            int next = prev + delta;
+            while (next >= 0 && (1 << next <= m_backOffCap) && !m_backpressureIndication.compareAndSet(prev, next)) {
+                prev = m_backpressureIndication.get();
+                delta = b ? 1 : -(prev > 1 ? prev >> 1 : 1);
+                next = prev + delta;
             }
+            return b;
         }
 
-        private void applyBackPressure(final boolean allowBackPressure) {
+        private void applyBackPressure(final boolean allowBackPressure, BackOff backOff) {
             if (!allowBackPressure) {
                 return;
             }
-            LOG.error("Sleep for back pressure for %d ms", highWaterMark);
+            int sleep = backOff.backoff(m_backpressureIndication.get());
+            LOG.warn("Sleep for back pressure for %d ms", sleep);
             try {
-                Thread.sleep(highWaterMark);
+                Thread.sleep(sleep);
             } catch (InterruptedException e) {
                 LOG.debug("Sleep for back pressure interrupted", e);
             }
+        }
+    }
+
+    abstract class BackOff {
+        int base;
+        int cap;
+        Random r;
+
+        public BackOff(int base, int cap) {
+            this.base = base;
+            this.cap = cap;
+            r = new Random();
+        }
+
+        public int expo(int n) {
+            return Math.min(cap, base * (1<<n));
+        }
+
+        abstract public int backoff(int n);
+    }
+
+    class ExpoBackOffFullJitter extends BackOff {
+
+        public ExpoBackOffFullJitter(int base, int cap) {
+            super(base, cap);
+        }
+
+        @Override
+        public int backoff(int n) {
+            return r.nextInt(expo(n));
+        }
+    }
+
+    class ExpoBackOffDecor extends BackOff {
+        int sleep;
+        public ExpoBackOffDecor(int base, int cap) {
+            super(base, cap);
+            sleep = base;
+        }
+
+        @Override
+        public int backoff(int n) {
+            sleep = n > 0 ? Math.min(cap, r.nextInt(sleep * 3 - base) + base) : base;
+            return sleep;
         }
     }
 }
