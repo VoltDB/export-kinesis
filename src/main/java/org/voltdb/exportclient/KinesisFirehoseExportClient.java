@@ -31,8 +31,8 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Properties;
 import java.util.Queue;
-import java.util.Random;
 import java.util.TimeZone;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -70,14 +70,25 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
     private String m_recordSeparator;
     private int m_backOffCap;
     private int m_backOffBase;
+    private int m_backOffConcurrentClient;
     private String m_backOffStrategy;
     private final AtomicInteger m_backpressureIndication = new AtomicInteger(0);
+    private final AtomicInteger m_FailuerCount = new AtomicInteger(0);
+    private final AtomicInteger m_SuccessCount = new AtomicInteger(0);
+    private boolean m_backOffAlwaysRestartBlock;
+    private boolean m_backOffAllow;
+
+
 
     public static final String ROW_LENGTH_LIMIT = "row.length.limit";
     public static final String RECORD_SEPARATOR = "record.separator";
-    public static final String BACKOFF_CAP = "backoff.cap.exponent";
+    public static final String BACKOFF_CAP = "backoff.cap";
     public static final String BACKOFF_BASE = "backoff.base";
     public static final String BACKOFF_STRATEGY = "backoff.strategy";
+    public static final String BACKOFF_CONCURRENT_CLIENT = "backoff.concurrent.client";
+
+    public static final String BACKOFF_ALLOW = "backoff.allow";
+    public static final String BACKOFF_ALWAYS_RESTARTBLOCK = "backoff.always.restartblock";
 
     @Override
     public void configure(Properties config) throws Exception
@@ -111,8 +122,18 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                 config.getProperty(ROW_LENGTH_LIMIT,Integer.toString(1024000 - m_recordSeparator.length())));
 
         m_backOffCap = Integer.parseInt(config.getProperty(BACKOFF_CAP,"1000"));
-        m_backOffBase = Integer.parseInt(config.getProperty(BACKOFF_BASE,"64"));
-        m_backOffStrategy = config.getProperty(BACKOFF_BASE,"full");
+        // minimal interval between each putRecordsBatch api call;
+        // for orignal limit, (5000 records/s  divie by 500 records per call = 10 calls)
+        // interval is 1000 ms / 10 = 100 ms
+        m_backOffBase = Integer.parseInt(config.getProperty(BACKOFF_BASE,"100"));
+
+        // concurrent aws client = number of export table to this stream * number of voltdb partition
+        m_backOffConcurrentClient = Integer.parseInt(config.getProperty(BACKOFF_CONCURRENT_CLIENT,"8"));
+        m_backOffStrategy = config.getProperty(BACKOFF_STRATEGY,"decor");
+
+
+        m_backOffAllow = Boolean.parseBoolean(config.getProperty(BACKOFF_ALLOW,"true"));
+        m_backOffAlwaysRestartBlock = Boolean.parseBoolean(config.getProperty(BACKOFF_ALWAYS_RESTARTBLOCK,"true"));
     }
 
     @Override
@@ -130,7 +151,6 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         private List<Record> currentBatch;
         private int m_currentBatchSize;
         private AmazonKinesisFirehoseClient m_firehoseClient;
-        private boolean allowBackPressure;
 
         // minimal interval between each putRecordsBatch api call;
         // based on the limit
@@ -167,7 +187,6 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                     + " table " + source.tableName
                     + " generation " + source.m_generation, CoreUtils.MEDIUM_STACK_SIZE);
             m_decoder = builder.build();
-            allowBackPressure = true;
         }
 
         private void validateStream() throws RestartBlockException, InterruptedException {
@@ -217,7 +236,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
             }
             // PutRecordBatchRequest can not contain more than 500 records
             // And up to a limit of 4 MB for the entire request
-            if (((m_currentBatchSize + rowSize) > BATCH_SIZE_LIMIT) || (currentBatch.size() >= BATCH_NUMBER_LIMIT)) {
+            if (((m_currentBatchSize + rowSize) > BATCH_SIZE_LIMIT) || (currentBatch.size() >= (BATCH_NUMBER_LIMIT/m_backOffConcurrentClient))) {
                 // roll to next batch
                 m_records.add(currentBatch);
                 m_currentBatchSize = 0;
@@ -280,19 +299,21 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                     int trial = 3;
                     boolean retry = true;
                     while (trial > 0 && retry) {
-                        applyBackPressure(allowBackPressure, backOff);
+                        applyBackPressure(m_backOffAllow, backOff);
                         PutRecordBatchResult res = m_firehoseClient.putRecordBatch(batchRequest);
                         if (res.getFailedPutCount() > 0) {
                             int i = 0;
                             for (PutRecordBatchResponseEntry entry : res.getRequestResponses()) {
                                 if (entry.getErrorMessage() != null) {
                                     LOG.warn("Record failed with response: %s, Error Code: %s. ", entry.getErrorMessage(), entry.getErrorCode());
-                                    if (!entry.getErrorCode().equals("ServiceUnavailableException")) {
+                                    LOG.debug("Record failed : %d, Success: %d. ", m_FailuerCount.incrementAndGet(), m_SuccessCount.get() );
+                                    if (!entry.getErrorCode().equals("ServiceUnavailableException") || m_backOffAlwaysRestartBlock) {
                                         throw new RestartBlockException(true);
                                     }
                                     i++;
                                 } else {
                                     recordsList.remove(i);
+                                    m_SuccessCount.incrementAndGet();
                                 }
                             }
                             setBackPressure(true);
@@ -301,6 +322,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                         } else {
                             retry = false;
                             setBackPressure(false);
+                            m_SuccessCount.addAndGet(recordsList.size());
                         }
                         trial--;
                     }
@@ -313,6 +335,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                 LOG.error("Failed to send record batch", e);
                 throw new RestartBlockException("Failed to send record batch", e, true);
             }
+            LOG.debug("Record failed : %d, Success: %d. ", m_FailuerCount.incrementAndGet(), m_SuccessCount.get());
         }
 
         private boolean setBackPressure(boolean b) {
@@ -344,12 +367,10 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
     abstract class BackOff {
         int base;
         int cap;
-        Random r;
 
         public BackOff(int base, int cap) {
             this.base = base;
             this.cap = cap;
-            r = new Random();
         }
 
         public int expo(int n) {
@@ -367,7 +388,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
 
         @Override
         public int backoff(int n) {
-            return r.nextInt(expo(n));
+            return ThreadLocalRandom.current().nextInt(expo(n));
         }
     }
 
@@ -380,7 +401,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         @Override
         public int backoff(int n) {
             int v = expo(n) / 2 ;
-            return v + r.nextInt(v);
+            return ThreadLocalRandom.current().nextInt(v, 3 * v);
         }
     }
 
@@ -393,7 +414,10 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
 
         @Override
         public int backoff(int n) {
-            sleep = n > 0 ? Math.min(cap, r.nextInt(sleep * 3 - base) + base) : base;
+            if (n == 0) {
+                sleep = base;
+            }
+            sleep = Math.min(cap, ThreadLocalRandom.current().nextInt(base, sleep * 3));
             return sleep;
         }
     }
