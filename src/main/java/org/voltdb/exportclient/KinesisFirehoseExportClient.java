@@ -70,12 +70,14 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
     private String m_recordSeparator;
     private int m_backOffCap;
     private int m_backOffBase;
+    private String m_backOffStrategy;
     private final AtomicInteger m_backpressureIndication = new AtomicInteger(0);
 
     public static final String ROW_LENGTH_LIMIT = "row.length.limit";
     public static final String RECORD_SEPARATOR = "record.separator";
     public static final String BACKOFF_CAP = "backoff.cap.exponent";
     public static final String BACKOFF_BASE = "backoff.base";
+    public static final String BACKOFF_STRATEGY = "backoff.strategy";
 
     @Override
     public void configure(Properties config) throws Exception
@@ -110,6 +112,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
 
         m_backOffCap = Integer.parseInt(config.getProperty(BACKOFF_CAP,"1000"));
         m_backOffBase = Integer.parseInt(config.getProperty(BACKOFF_BASE,"64"));
+        m_backOffStrategy = config.getProperty(BACKOFF_BASE,"full");
     }
 
     @Override
@@ -257,7 +260,19 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
             }
             try {
                 List<Record> recordsList;
-                BackOff backOff = new ExpoBackOffFullJitter(m_backOffBase, m_backOffCap);
+                BackOff backOff;
+                switch (m_backOffStrategy) {
+                    case "full":
+                        backOff = new ExpoBackOffFullJitter(m_backOffBase, m_backOffCap);
+                        break;
+                    case "equal":
+                        backOff = new ExpoBackOffEqualJitter(m_backOffBase, m_backOffCap);
+                        break;
+                    default:
+                        backOff = new ExpoBackOffDecor(m_backOffBase, m_backOffCap);
+                        break;
+                }
+
                 while (!m_records.isEmpty()) {
                     recordsList = m_records.poll();
                     PutRecordBatchRequest batchRequest = new PutRecordBatchRequest().withDeliveryStreamName(
@@ -353,6 +368,19 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         @Override
         public int backoff(int n) {
             return r.nextInt(expo(n));
+        }
+    }
+
+    class ExpoBackOffEqualJitter extends BackOff {
+
+        public ExpoBackOffEqualJitter(int base, int cap) {
+            super(base, cap);
+        }
+
+        @Override
+        public int backoff(int n) {
+            int v = expo(n) / 2 ;
+            return v + r.nextInt(v);
         }
     }
 
