@@ -48,9 +48,9 @@ public class FirehoseSink {
 
     private final List<ListeningExecutorService> m_executors;
 
-    private String m_streamName;
+    private final String m_streamName;
     private AmazonKinesisFirehoseClient m_client;
-    private int m_concurrentWriters;
+    private final int m_concurrentWriters;
     private final AtomicInteger m_backpressureIndication = new AtomicInteger(0);
     private BackOff m_backOff;
 

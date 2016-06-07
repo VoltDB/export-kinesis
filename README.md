@@ -96,3 +96,5 @@ INSERT INTO ALERTS (ID,MSG,CONTINENT,COUNTRY) VALUES (1,'fab-02 inoperable','EU'
 - `access.key` (mandatory) user's access key
 - `secret.key` (mandatory) user's secret key
 - `timezone` (optional, _default:_ local timezone) timezone used to format timestamp values
+- `stream.limit` (optional, _default:_ 5000 records/s) Firehose Delivery Stream limit on AWS side, i.e. how many records per second it can accept
+- `concurrent.writers` (optional, _default:_ 1) The number of writers in the concurrent writer pool, sharing the connection to AWS

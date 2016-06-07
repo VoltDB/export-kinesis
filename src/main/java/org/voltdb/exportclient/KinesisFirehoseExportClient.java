@@ -55,7 +55,7 @@ import com.google_voltpatches.common.base.Throwables;
 import com.google_voltpatches.common.util.concurrent.ListeningExecutorService;
 
 public class KinesisFirehoseExportClient extends ExportClientBase {
-    private static final ExportClientLogger LOG = new ExportClientLogger();
+    private static final FirehoseExportLogger LOG = new FirehoseExportLogger();
 
     private Region m_region;
     private String m_streamName;
@@ -80,7 +80,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
     public static final String BACKOFF_CAP = "backoff.cap";
     public static final String STREAM_LIMIT = "stream.limit";
     public static final String BACKOFF_TYPE = "backoff.type";
-    public static final String CONCURRENT_WRITER = "concurrent.writer";
+    public static final String CONCURRENT_WRITER = "concurrent.writers";
 
     public static final int BATCH_NUMBER_LIMIT = 500;
     public static final int BATCH_SIZE_LIMIT = 4*1024*1024;
@@ -127,7 +127,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
 
         // concurrent aws client = number of export table to this stream * number of voltdb partition
         m_concurrentWriter = Integer.parseInt(config.getProperty(CONCURRENT_WRITER,"8"));
-        m_backOffStrategy = config.getProperty(BACKOFF_TYPE,"decor");
+        m_backOffStrategy = config.getProperty(BACKOFF_TYPE,"full");
 
         m_firehoseClient = new AmazonKinesisFirehoseClient(
                 new BasicAWSCredentials(m_accessKey, m_secretKey));
