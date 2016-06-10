@@ -48,9 +48,6 @@ import com.amazonaws.services.kinesisfirehose.AmazonKinesisFirehoseClient;
 import com.amazonaws.services.kinesisfirehose.model.DescribeDeliveryStreamRequest;
 import com.amazonaws.services.kinesisfirehose.model.DescribeDeliveryStreamResult;
 import com.amazonaws.services.kinesisfirehose.model.InvalidArgumentException;
-import com.amazonaws.services.kinesisfirehose.model.PutRecordBatchRequest;
-import com.amazonaws.services.kinesisfirehose.model.PutRecordBatchResponseEntry;
-import com.amazonaws.services.kinesisfirehose.model.PutRecordBatchResult;
 import com.amazonaws.services.kinesisfirehose.model.Record;
 import com.amazonaws.services.kinesisfirehose.model.ResourceNotFoundException;
 import com.amazonaws.services.kinesisfirehose.model.ServiceUnavailableException;
@@ -58,16 +55,35 @@ import com.google_voltpatches.common.base.Throwables;
 import com.google_voltpatches.common.util.concurrent.ListeningExecutorService;
 
 public class KinesisFirehoseExportClient extends ExportClientBase {
-    private static final ExportClientLogger LOG = new ExportClientLogger();
+    private static final FirehoseExportLogger LOG = new FirehoseExportLogger();
 
     private Region m_region;
     private String m_streamName;
     private String m_accessKey;
     private String m_secretKey;
     private TimeZone m_timeZone;
+    private AmazonKinesisFirehoseClient m_firehoseClient;
+    private FirehoseSink m_sink;
     private String m_recordSeparator;
+
+
+    private int m_backOffCap;
+    private int m_backOffBase;
+    private int m_streamLimit;
+    private int m_concurrentWriter;
+    private String m_backOffStrategy;
+    private BackOff m_backOff;
+
     public static final String ROW_LENGTH_LIMIT = "row.length.limit";
     public static final String RECORD_SEPARATOR = "record.separator";
+
+    public static final String BACKOFF_CAP = "backoff.cap";
+    public static final String STREAM_LIMIT = "stream.limit";
+    public static final String BACKOFF_TYPE = "backoff.type";
+    public static final String CONCURRENT_WRITER = "concurrent.writers";
+
+    public static final int BATCH_NUMBER_LIMIT = 500;
+    public static final int BATCH_SIZE_LIMIT = 4*1024*1024;
 
     @Override
     public void configure(Properties config) throws Exception
@@ -99,6 +115,25 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
 
         config.setProperty(ROW_LENGTH_LIMIT,
                 config.getProperty(ROW_LENGTH_LIMIT,Integer.toString(1024000 - m_recordSeparator.length())));
+
+        m_backOffCap = Integer.parseInt(config.getProperty(BACKOFF_CAP,"1000"));
+        // minimal interval between each putRecordsBatch api call;
+        // for small records (row length < 1KB): records/s is the bottleneck
+        // for large records (row length > 1KB): data throughput is the bottleneck
+        // for orignal limit, (5000 records/s  divie by 500 records per call = 10 calls)
+        // interval is 1000 ms / 10 = 100 ms
+        m_streamLimit = Integer.parseInt(config.getProperty(STREAM_LIMIT,"5000"));
+        m_backOffBase = Math.max(2, 1000 / (m_streamLimit/BATCH_NUMBER_LIMIT));
+
+        // concurrent aws client = number of export table to this stream * number of voltdb partition
+        m_concurrentWriter = Integer.parseInt(config.getProperty(CONCURRENT_WRITER,"8"));
+        m_backOffStrategy = config.getProperty(BACKOFF_TYPE,"full");
+
+        m_firehoseClient = new AmazonKinesisFirehoseClient(
+                new BasicAWSCredentials(m_accessKey, m_secretKey));
+        m_firehoseClient.setRegion(m_region);
+        m_backOff = BackOffFactory.getBackOff(m_backOffStrategy, m_backOffBase, m_backOffCap);
+        m_sink = new FirehoseSink(m_streamName,m_firehoseClient, m_concurrentWriter, m_backOff);
     }
 
     @Override
@@ -115,10 +150,6 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         private Queue<List<Record>> m_records;
         private List<Record> currentBatch;
         private int m_currentBatchSize;
-        private AmazonKinesisFirehoseClient m_firehoseClient;
-
-        public static final int BATCH_NUMBER_LIMIT = 500;
-        public static final int BATCH_SIZE_LIMIT = 4*1024*1024;
 
         @Override
         public ListeningExecutorService getExecutor() {
@@ -165,9 +196,6 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
 
         final void checkOnFirstRow() throws RestartBlockException {
             if (!m_primed) try {
-                m_firehoseClient = new AmazonKinesisFirehoseClient(
-                        new BasicAWSCredentials(m_accessKey, m_secretKey));
-                m_firehoseClient.setRegion(m_region);
                 validateStream();
             } catch (AmazonServiceException | InterruptedException e) {
                 LOG.error("Unable to instantiate a Amazon Kinesis Firehose client", e);
@@ -190,7 +218,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
             }
             // PutRecordBatchRequest can not contain more than 500 records
             // And up to a limit of 4 MB for the entire request
-            if (((m_currentBatchSize + rowSize) > BATCH_SIZE_LIMIT) || (currentBatch.size() >= BATCH_NUMBER_LIMIT)) {
+            if (((m_currentBatchSize + rowSize) > BATCH_SIZE_LIMIT) || (currentBatch.size() >= (BATCH_NUMBER_LIMIT/m_concurrentWriter))) {
                 // roll to next batch
                 m_records.add(currentBatch);
                 m_currentBatchSize = 0;
@@ -223,8 +251,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         }
 
         @Override
-        public void onBlockCompletion() throws RestartBlockException
-        {
+        public void onBlockCompletion() throws RestartBlockException {
             // add last batch
             if (!currentBatch.isEmpty()) {
                 // roll to next batch
@@ -232,31 +259,12 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                 m_currentBatchSize = 0;
                 currentBatch = new LinkedList<Record>();
             }
-            try {
-                List<Record> recordsList;
-                int sleepTime = 0;
 
-                while (!m_records.isEmpty()) {
-                    if (sleepTime > 0)
-                        Thread.sleep(sleepTime);
-                    recordsList = m_records.poll();
-                    PutRecordBatchRequest batchRequest = new PutRecordBatchRequest().
-                            withDeliveryStreamName(m_streamName).
-                            withRecords(recordsList);
-                    PutRecordBatchResult res = m_firehoseClient.putRecordBatch(batchRequest);
-                    if (res.getFailedPutCount() > 0) {
-                        for (PutRecordBatchResponseEntry entry : res.getRequestResponses()) {
-                            if (entry.getErrorMessage() != null && !entry.getErrorMessage().contains("Slow down.")) {
-                                LOG.error("Record failed with response: %s", entry.getErrorMessage());
-                                throw new RestartBlockException(true);
-                            }
-                        }
-                        sleepTime = sleepTime == 0 ? 1000 : sleepTime*2;
-                    } else {
-                        sleepTime = sleepTime == 0 ? 0 : sleepTime-10;
-                    }
-                }
-            } catch (ResourceNotFoundException | InvalidArgumentException | ServiceUnavailableException | InterruptedException e) {
+            try {
+                m_sink.write(m_records);
+            } catch (FirehoseExportException e) {
+                throw new RestartBlockException("firehose write fault", e, true);
+            } catch (ResourceNotFoundException | InvalidArgumentException | ServiceUnavailableException e) {
                 LOG.error("Failed to send record batch", e);
                 throw new RestartBlockException("Failed to send record batch", e, true);
             }
