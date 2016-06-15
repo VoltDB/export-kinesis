@@ -30,6 +30,7 @@ import java.util.Queue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.voltcore.utils.CoreUtils;
@@ -38,6 +39,7 @@ import com.amazonaws.services.kinesisfirehose.AmazonKinesisFirehoseClient;
 import com.amazonaws.services.kinesisfirehose.model.PutRecordBatchRequest;
 import com.amazonaws.services.kinesisfirehose.model.PutRecordBatchResult;
 import com.amazonaws.services.kinesisfirehose.model.Record;
+import com.google_voltpatches.common.base.Throwables;
 import com.google_voltpatches.common.collect.ImmutableList;
 import com.google_voltpatches.common.util.concurrent.Futures;
 import com.google_voltpatches.common.util.concurrent.ListenableFuture;
@@ -70,7 +72,7 @@ public class FirehoseSink {
     ListenableFuture<?> asWriteTask(List<Record> recordsList) {
         final int hashed = ThreadLocalRandom.current().nextInt(m_concurrentWriters);
         if (m_executors.get(hashed).isShutdown()) {
-            return Futures.immediateFailedFuture(new FirehoseExportException("hive sink executor is shut down"));
+            return Futures.immediateFailedFuture(new FirehoseExportException("Firehose sink executor is shut down"));
         }
         return m_executors.get(hashed).submit(new Callable<Void>() {
             @Override
@@ -131,6 +133,17 @@ public class FirehoseSink {
             Thread.sleep(sleep);
         } catch (InterruptedException e) {
             LOG.debug("Sleep for back pressure interrupted", e);
+        }
+    }
+
+    public void shutDown(){
+        for(ListeningExecutorService srv : m_executors){
+            srv.shutdown();
+            try {
+                srv.awaitTermination(365, TimeUnit.DAYS);
+            } catch (InterruptedException e) {
+                Throwables.propagate(e);
+            }
         }
     }
 }

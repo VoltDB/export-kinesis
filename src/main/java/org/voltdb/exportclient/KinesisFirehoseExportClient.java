@@ -232,6 +232,9 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         @Override
         public void sourceNoLongerAdvertised(AdvertisedDataSource source)
         {
+            if(m_sink != null){
+                m_sink.shutDown();
+            }
             if (m_firehoseClient != null) m_firehoseClient.shutdown();
             m_es.shutdown();
             try {
