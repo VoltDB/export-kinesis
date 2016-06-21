@@ -126,8 +126,8 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         m_backOffBase = Math.max(2, 1000 / (m_streamLimit/BATCH_NUMBER_LIMIT));
 
         // concurrent aws client = number of export table to this stream * number of voltdb partition
-        m_concurrentWriter = Integer.parseInt(config.getProperty(CONCURRENT_WRITER,"8"));
-        m_backOffStrategy = config.getProperty(BACKOFF_TYPE,"full");
+        m_concurrentWriter = Integer.parseInt(config.getProperty(CONCURRENT_WRITER,"1"));
+        m_backOffStrategy = config.getProperty(BACKOFF_TYPE,"equal");
 
         m_firehoseClient = new AmazonKinesisFirehoseClient(
                 new BasicAWSCredentials(m_accessKey, m_secretKey));
@@ -264,7 +264,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
             }
 
             try {
-                m_sink.write(m_records);
+                m_sink.syncWrite(m_records);
             } catch (FirehoseExportException e) {
                 throw new RestartBlockException("firehose write fault", e, true);
             } catch (ResourceNotFoundException | InvalidArgumentException | ServiceUnavailableException e) {
