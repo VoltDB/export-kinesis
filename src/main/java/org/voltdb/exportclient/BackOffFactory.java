@@ -25,7 +25,7 @@
 package org.voltdb.exportclient;
 
 import java.lang.reflect.Constructor;
-
+import org.hsqldb_voltpatches.lib.StringUtil;
 import com.google_voltpatches.common.base.Throwables;
 
 public class BackOffFactory {
@@ -38,12 +38,14 @@ public class BackOffFactory {
         case "decor":
             return new ExpoBackOffDecor(backOffBase, backOffCap);
         default:
-            try {
-                Constructor<?> c = Class.forName(backOffType).getConstructor(Integer.TYPE, Integer.TYPE);
-                BackOff backoff = (BackOff) c.newInstance(backOffBase, backOffCap);
-                return backoff;
-            } catch(Throwable t) {
-                Throwables.propagate(t);
+            if(!StringUtil.isEmpty(backOffType)){
+                try {
+                    Constructor<?> c = Class.forName(backOffType).getConstructor(Integer.TYPE, Integer.TYPE);
+                    BackOff backoff = (BackOff) c.newInstance(backOffBase, backOffCap);
+                    return backoff;
+                } catch(Throwable t) {
+                    Throwables.propagate(t);
+                }
             }
             return new ExpoBackOffDecor(backOffBase, backOffCap);
         }
