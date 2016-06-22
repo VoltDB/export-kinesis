@@ -73,6 +73,8 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
     private int m_concurrentWriter;
     private String m_backOffStrategy;
     private BackOff m_backOff;
+    private boolean m_batchMode;
+    private int m_batchSize;
 
     public static final String ROW_LENGTH_LIMIT = "row.length.limit";
     public static final String RECORD_SEPARATOR = "record.separator";
@@ -81,6 +83,8 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
     public static final String STREAM_LIMIT = "stream.limit";
     public static final String BACKOFF_TYPE = "backoff.type";
     public static final String CONCURRENT_WRITER = "concurrent.writers";
+    public static final String BATCH_MODE = "batch.mode";
+    public static final String BATCH_SIZE = "batch.size";
 
     public static final int BATCH_NUMBER_LIMIT = 500;
     public static final int BATCH_SIZE_LIMIT = 4*1024*1024;
@@ -126,14 +130,15 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         m_backOffBase = Math.max(2, 1000 / (m_streamLimit/BATCH_NUMBER_LIMIT));
 
         // concurrent aws client = number of export table to this stream * number of voltdb partition
-        m_concurrentWriter = Integer.parseInt(config.getProperty(CONCURRENT_WRITER,"1"));
+        m_concurrentWriter = Integer.parseInt(config.getProperty(CONCURRENT_WRITER,"0"));
         m_backOffStrategy = config.getProperty(BACKOFF_TYPE,"equal");
 
-        m_firehoseClient = new AmazonKinesisFirehoseClient(
-                new BasicAWSCredentials(m_accessKey, m_secretKey));
+        m_firehoseClient = new AmazonKinesisFirehoseClient(new BasicAWSCredentials(m_accessKey, m_secretKey));
         m_firehoseClient.setRegion(m_region);
         m_backOff = BackOffFactory.getBackOff(m_backOffStrategy, m_backOffBase, m_backOffCap);
         m_sink = new FirehoseSink(m_streamName,m_firehoseClient, m_concurrentWriter, m_backOff);
+        m_batchMode = Boolean.parseBoolean(config.getProperty(BATCH_MODE, "true"));
+        m_batchSize = Math.min(BATCH_NUMBER_LIMIT, Integer.parseInt(config.getProperty(BATCH_SIZE,"200")));
     }
 
     @Override
@@ -216,16 +221,27 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                 LOG.error("Failed to build record", e);
                 throw new RestartBlockException("Failed to build record", e, true);
             }
-            // PutRecordBatchRequest can not contain more than 500 records
-            // And up to a limit of 4 MB for the entire request
-            if (((m_currentBatchSize + rowSize) > BATCH_SIZE_LIMIT) || (currentBatch.size() >= (BATCH_NUMBER_LIMIT/m_concurrentWriter))) {
-                // roll to next batch
-                m_records.add(currentBatch);
-                m_currentBatchSize = 0;
-                currentBatch = new LinkedList<Record>();
+            if(m_batchMode){
+                // PutRecordBatchRequest can not contain more than 500 records
+                // And up to a limit of 4 MB for the entire request
+                if ((m_currentBatchSize + rowSize) > BATCH_SIZE_LIMIT || currentBatch.size() >= m_batchSize) {
+                    // roll to next batch
+                    m_records.add(currentBatch);
+                    m_currentBatchSize = 0;
+                    currentBatch = new LinkedList<Record>();
+                }
+                currentBatch.add(record);
+                m_currentBatchSize += rowSize;
+            }else{
+                try {
+                    m_sink.writeRow(record);
+                } catch (FirehoseExportException e) {
+                    throw new RestartBlockException("firehose write fault", e, true);
+                } catch (ResourceNotFoundException | InvalidArgumentException | ServiceUnavailableException e) {
+                    LOG.error("Failed to send record batch", e);
+                    throw new RestartBlockException("Failed to send record batch", e, true);
+                }
             }
-            currentBatch.add(record);
-            m_currentBatchSize += rowSize;
             return true;
         }
 
@@ -255,21 +271,28 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
 
         @Override
         public void onBlockCompletion() throws RestartBlockException {
-            // add last batch
-            if (!currentBatch.isEmpty()) {
-                // roll to next batch
-                m_records.add(currentBatch);
-                m_currentBatchSize = 0;
-                currentBatch = new LinkedList<Record>();
-            }
 
-            try {
-                m_sink.syncWrite(m_records);
-            } catch (FirehoseExportException e) {
-                throw new RestartBlockException("firehose write fault", e, true);
-            } catch (ResourceNotFoundException | InvalidArgumentException | ServiceUnavailableException e) {
-                LOG.error("Failed to send record batch", e);
-                throw new RestartBlockException("Failed to send record batch", e, true);
+            if(m_batchMode){
+                // add last batch
+                if (!currentBatch.isEmpty()) {
+                    // roll to next batch
+                    m_records.add(currentBatch);
+                    m_currentBatchSize = 0;
+                    currentBatch = new LinkedList<Record>();
+                }
+
+                try {
+                    if(m_concurrentWriter > 0){
+                        m_sink.write(m_records);
+                    }else{
+                        m_sink.syncWrite(m_records);
+                    }
+                } catch (FirehoseExportException e) {
+                    throw new RestartBlockException("firehose write fault", e, true);
+                } catch (ResourceNotFoundException | InvalidArgumentException | ServiceUnavailableException e) {
+                    LOG.error("Failed to send record batch", e);
+                    throw new RestartBlockException("Failed to send record batch", e, true);
+                }
             }
         }
     }

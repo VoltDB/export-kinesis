@@ -38,6 +38,7 @@ import org.voltcore.utils.CoreUtils;
 import com.amazonaws.services.kinesisfirehose.AmazonKinesisFirehoseClient;
 import com.amazonaws.services.kinesisfirehose.model.PutRecordBatchRequest;
 import com.amazonaws.services.kinesisfirehose.model.PutRecordBatchResult;
+import com.amazonaws.services.kinesisfirehose.model.PutRecordRequest;
 import com.amazonaws.services.kinesisfirehose.model.Record;
 import com.amazonaws.services.kinesisfirehose.model.ServiceUnavailableException;
 import com.google_voltpatches.common.base.Throwables;
@@ -114,6 +115,26 @@ public class FirehoseSink {
         }
     }
 
+    public void writeRow(Record record){
+        int retry = MAX_RETRY;
+        while (retry > 0){
+            try {
+                PutRecordRequest putRecordRequest = new PutRecordRequest();
+                putRecordRequest.setDeliveryStreamName(m_streamName);
+                putRecordRequest.setRecord(record);
+                m_client.putRecord(putRecordRequest);
+            } catch (ServiceUnavailableException e){
+                if(retry == 1){
+                    throw new FirehoseExportException("Failed to send record", e, true);
+                }else{
+                    LOG.warn("Failed to send record: %s. Retry #%d", e.getErrorMessage(), (MAX_RETRY-retry + 1));
+                    backoffSleep(retry);
+                }
+            }
+            retry--;
+        }
+    }
+
     public void syncWrite(Queue<List<Record>> records) {
 
         for (List<Record> recordsList : records) {
@@ -131,6 +152,7 @@ public class FirehoseSink {
                             backoffSleep(retry);
                         }
                     }else{
+                        recordsList.clear();
                         break;
                     }
                 } catch (ServiceUnavailableException e){
@@ -146,13 +168,13 @@ public class FirehoseSink {
         }
     }
 
-    private void backoffSleep(int retryCount) {
+    private void backoffSleep(int seed) {
         try {
-            int sleep = m_backOff.backoff(retryCount);
+            int sleep = m_backOff.backoff(seed);
             Thread.sleep(sleep);
             LOG.warn("Sleep for back pressure for %d ms", sleep);
         } catch (InterruptedException e) {
-            LOG.warn("Interrupted sleep when checkpointing: %s", e.getMessage());
+            LOG.warn("Interrupted sleep: %s", e.getMessage());
         }
     }
 
