@@ -38,7 +38,9 @@ import org.voltcore.utils.CoreUtils;
 import com.amazonaws.services.kinesisfirehose.AmazonKinesisFirehoseClient;
 import com.amazonaws.services.kinesisfirehose.model.PutRecordBatchRequest;
 import com.amazonaws.services.kinesisfirehose.model.PutRecordBatchResult;
+import com.amazonaws.services.kinesisfirehose.model.PutRecordRequest;
 import com.amazonaws.services.kinesisfirehose.model.Record;
+import com.amazonaws.services.kinesisfirehose.model.ServiceUnavailableException;
 import com.google_voltpatches.common.base.Throwables;
 import com.google_voltpatches.common.collect.ImmutableList;
 import com.google_voltpatches.common.util.concurrent.Futures;
@@ -47,7 +49,7 @@ import com.google_voltpatches.common.util.concurrent.ListeningExecutorService;
 
 public class FirehoseSink {
     private final static FirehoseExportLogger LOG = new FirehoseExportLogger();
-
+    private final static int MAX_RETRY = 9;
     private final List<ListeningExecutorService> m_executors;
 
     private final String m_streamName;
@@ -55,7 +57,6 @@ public class FirehoseSink {
     private final int m_concurrentWriters;
     private final AtomicInteger m_backpressureIndication = new AtomicInteger(0);
     private BackOff m_backOff;
-
     public FirehoseSink(String streamName, AmazonKinesisFirehoseClient client, int concurrentWriters, BackOff backOff) {
         ImmutableList.Builder<ListeningExecutorService> lbldr = ImmutableList.builder();
         for (int i = 0; i < concurrentWriters; ++i) {
@@ -114,6 +115,69 @@ public class FirehoseSink {
         }
     }
 
+    public void writeRow(Record record){
+        int retry = MAX_RETRY;
+        while (retry > 0){
+            try {
+                PutRecordRequest putRecordRequest = new PutRecordRequest();
+                putRecordRequest.setDeliveryStreamName(m_streamName);
+                putRecordRequest.setRecord(record);
+                m_client.putRecord(putRecordRequest);
+            } catch (ServiceUnavailableException e){
+                if(retry == 1){
+                    throw new FirehoseExportException("Failed to send record", e, true);
+                }else{
+                    LOG.warn("Failed to send record: %s. Retry #%d", e.getErrorMessage(), (MAX_RETRY-retry + 1));
+                    backoffSleep(retry);
+                }
+            }
+            retry--;
+        }
+    }
+
+    public void syncWrite(Queue<List<Record>> records) {
+
+        for (List<Record> recordsList : records) {
+            int retry = MAX_RETRY;
+            while (retry > 0){
+                try {
+                    PutRecordBatchRequest batchRequest = new PutRecordBatchRequest().withDeliveryStreamName(m_streamName).withRecords(recordsList);
+                    PutRecordBatchResult res = m_client.putRecordBatch(batchRequest);
+                    if (res.getFailedPutCount() > 0) {
+                        String msg = "Records failed with the batch: %d, retry: #%d";
+                        if(retry == 1){
+                            throw new FirehoseExportException(msg, res.getFailedPutCount(), (MAX_RETRY-retry + 1));
+                        }else{
+                            LOG.warn(msg, res.getFailedPutCount(), (MAX_RETRY-retry + 1));
+                            backoffSleep(retry);
+                        }
+                    }else{
+                        recordsList.clear();
+                        break;
+                    }
+                } catch (ServiceUnavailableException e){
+                    if(retry == 1){
+                        throw new FirehoseExportException("Failed to send record batch", e, true);
+                    }else{
+                        LOG.warn("Failed to send record batch: %s. Retry #%d", e.getErrorMessage(), (MAX_RETRY-retry + 1));
+                        backoffSleep(retry);
+                    }
+                }
+                retry--;
+            }
+        }
+    }
+
+    private void backoffSleep(int seed) {
+        try {
+            int sleep = m_backOff.backoff(seed);
+            Thread.sleep(sleep);
+            LOG.warn("Sleep for back pressure for %d ms", sleep);
+        } catch (InterruptedException e) {
+            LOG.warn("Interrupted sleep: %s", e.getMessage());
+        }
+    }
+
     private boolean setBackPressure(boolean b) {
         int prev = m_backpressureIndication.get();
         int delta = b ? 1 : -(prev > 1 ? prev >> 1 : 1);
@@ -137,12 +201,14 @@ public class FirehoseSink {
     }
 
     public void shutDown(){
-        for(ListeningExecutorService srv : m_executors){
-            srv.shutdown();
-            try {
-                srv.awaitTermination(365, TimeUnit.DAYS);
-            } catch (InterruptedException e) {
-                Throwables.propagate(e);
+        if(m_executors != null){
+            for(ListeningExecutorService srv : m_executors){
+                srv.shutdown();
+                try {
+                    srv.awaitTermination(365, TimeUnit.DAYS);
+                } catch (InterruptedException e) {
+                    Throwables.propagate(e);
+                }
             }
         }
     }
