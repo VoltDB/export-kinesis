@@ -166,14 +166,8 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
             builder
                 .dateFormatter(Constants.ODBC_DATE_FORMAT_STRING)
                 .timeZone(m_timeZone);
-            // TODO: currently thread name includes table name fetched from ADS name
-            // to not include thread name - though having thread name is useful in
-            // debugging. An alternative is postpond thread creation to later during
-            // onBlockStart() or processRow()
             m_es = CoreUtils.getListeningSingleThreadExecutor(
-                    "Kinesis Firehose Export decoder for partition " + source.partitionId
-                    + " table " + source.tableName
-                    + " generation " + source.m_generation, CoreUtils.MEDIUM_STACK_SIZE);
+                    "Kinesis Firehose Export decoder for partition " + source.partitionId, CoreUtils.MEDIUM_STACK_SIZE);
             m_decoder = builder.build();
         }
 
@@ -197,7 +191,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
             }
         }
 
-        final void checkOnFirstRow() throws RestartBlockException {
+        final void checkOnFirstRow(ExportRowData row) throws RestartBlockException {
             if (m_primed) {
                 return;
             }
@@ -208,13 +202,21 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                 LOG.error("Unable to instantiate a Amazon Kinesis Firehose client", e);
                 throw new RestartBlockException("Unable to instantiate a Amazon Kinesis Firehose client", e, true);
             }
+
+            try {
+                String threadName = "Kinesis Firehose Export decoder for partition " + row.partitionId
+                        + " table " + row.tableName + " generation " + row.generation;
+                Thread.currentThread().setName(threadName);
+            }
+            catch (SecurityException ignore) { }
+
             m_primed = true;
         }
 
         @Override
         public boolean processRow(ExportRowData rowData) throws RestartBlockException {
             if (!m_primed) {
-                checkOnFirstRow();
+                checkOnFirstRow(rowData);
             }
 
             Record record = new Record();
@@ -271,7 +273,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         @Override
         public void onBlockStart(ExportRowData row) throws RestartBlockException {
             if (!m_primed) {
-                checkOnFirstRow();
+                checkOnFirstRow(row);
             }
             m_records = new LinkedList<List<Record>>();
             m_currentBatchSize = 0;
