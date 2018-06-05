@@ -24,7 +24,6 @@
 
 package org.voltdb.exportclient;
 
-import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedList;
@@ -35,10 +34,11 @@ import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
 
 import org.voltcore.utils.CoreUtils;
+
 import org.voltdb.VoltDB;
 import org.voltdb.common.Constants;
 import org.voltdb.export.AdvertisedDataSource;
-import org.voltdb.exportclient.decode.CSVStringDecoder;
+import org.voltdb.exportclient.decode.v2.CSVStringDecoder;
 
 import com.amazonaws.AmazonServiceException;
 import com.amazonaws.auth.BasicAWSCredentials;
@@ -90,8 +90,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
     public static final int BATCH_SIZE_LIMIT = 4*1024*1024;
 
     @Override
-    public void configure(Properties config) throws Exception
-    {
+    public void configure(Properties config) throws Exception {
         String regionName = config.getProperty("region","").trim();
         if (regionName.isEmpty()) {
             throw new IllegalArgumentException("KinesisFirehoseExportClient: must provide a region");
@@ -122,9 +121,9 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
 
         m_backOffCap = Integer.parseInt(config.getProperty(BACKOFF_CAP,"1000"));
         // minimal interval between each putRecordsBatch api call;
-        // for small records (row length < 1KB): records/s is the bottleneck
+        // for small records (row length < 1KB): record/s is the bottleneck
         // for large records (row length > 1KB): data throughput is the bottleneck
-        // for orignal limit, (5000 records/s  divie by 500 records per call = 10 calls)
+        // for original limit, (5000 records/s  divide by 500 records per call = 10 calls)
         // interval is 1000 ms / 10 = 100 ms
         m_streamLimit = Integer.parseInt(config.getProperty(STREAM_LIMIT,"5000"));
         m_backOffBase = Math.max(2, 1000 / (m_streamLimit/BATCH_NUMBER_LIMIT));
@@ -142,8 +141,7 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
     }
 
     @Override
-    public ExportDecoderBase constructExportDecoder(AdvertisedDataSource source)
-    {
+    public ExportDecoderBase constructExportDecoder(AdvertisedDataSource source) {
         return new KinesisFirehoseExportDecoder(source);
     }
 
@@ -161,21 +159,15 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
             return m_es;
         }
 
-        public KinesisFirehoseExportDecoder(AdvertisedDataSource source)
-        {
+        public KinesisFirehoseExportDecoder(AdvertisedDataSource source) {
             super(source);
 
             CSVStringDecoder.Builder builder = CSVStringDecoder.builder();
             builder
                 .dateFormatter(Constants.ODBC_DATE_FORMAT_STRING)
-                .timeZone(m_timeZone)
-                .columnNames(source.columnNames)
-                .columnTypes(source.columnTypes)
-            ;
+                .timeZone(m_timeZone);
             m_es = CoreUtils.getListeningSingleThreadExecutor(
-                    "Kinesis Firehose Export decoder for partition " + source.partitionId
-                    + " table " + source.tableName
-                    + " generation " + source.m_generation, CoreUtils.MEDIUM_STACK_SIZE);
+                    "Kinesis Firehose Export decoder for partition " + source.partitionId, CoreUtils.MEDIUM_STACK_SIZE);
             m_decoder = builder.build();
         }
 
@@ -186,10 +178,10 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
             String status = "UNDEFINED";
             describeHoseResult = m_firehoseClient.describeDeliveryStream(describeHoseRequest);
             status = describeHoseResult.getDeliveryStreamDescription().getDeliveryStreamStatus();
-            if("ACTIVE".equalsIgnoreCase(status)){
+            if ("ACTIVE".equalsIgnoreCase(status)) {
                 return;
             }
-            else if("CREATING".equalsIgnoreCase(status)){
+            else if("CREATING".equalsIgnoreCase(status)) {
                 Thread.sleep(5000);
                 validateStream();
             }
@@ -199,45 +191,60 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
             }
         }
 
-        final void checkOnFirstRow() throws RestartBlockException {
-            if (!m_primed) try {
+        final void checkOnFirstRow(ExportRowData row) throws RestartBlockException {
+            if (m_primed) {
+                return;
+            }
+
+            try {
                 validateStream();
             } catch (AmazonServiceException | InterruptedException e) {
                 LOG.error("Unable to instantiate a Amazon Kinesis Firehose client", e);
                 throw new RestartBlockException("Unable to instantiate a Amazon Kinesis Firehose client", e, true);
             }
+
+            try {
+                String threadName = "Kinesis Firehose Export decoder for partition " + row.partitionId
+                        + " table " + row.tableName + " generation " + row.generation;
+                Thread.currentThread().setName(threadName);
+            }
+            catch (SecurityException ignore) { }
+
             m_primed = true;
         }
 
         @Override
-        public boolean processRow(int rowSize, byte[] rowData) throws RestartBlockException {
-            if (!m_primed) checkOnFirstRow();
-            Record record = new Record();
-            try {
-                final ExportRowData rd = decodeRow(rowData);
-                String decoded = m_decoder.decode(null, rd.values) + m_recordSeparator; // add a record separator ;
-                record.withData(ByteBuffer.wrap(decoded.getBytes(StandardCharsets.UTF_8)));
-            } catch(IOException e) {
-                LOG.error("Failed to build record", e);
-                throw new RestartBlockException("Failed to build record", e, true);
+        public boolean processRow(ExportRowData rowData) throws RestartBlockException {
+            if (!m_primed) {
+                checkOnFirstRow(rowData);
             }
-            if(m_batchMode){
+
+            Record record = new Record();
+            String decoded = m_decoder.decode(rowData.generation, rowData.tableName, rowData.types, rowData.names, null, rowData.values)
+                    + m_recordSeparator; // add a record separator ;
+            final byte[] data = decoded.getBytes(StandardCharsets.UTF_8);
+            record.withData(ByteBuffer.wrap(data));
+
+            if (m_batchMode) {
                 // PutRecordBatchRequest can not contain more than 500 records
                 // And up to a limit of 4 MB for the entire request
-                if ((m_currentBatchSize + rowSize) > BATCH_SIZE_LIMIT || currentBatch.size() >= m_batchSize) {
+                if ((m_currentBatchSize + data.length) > BATCH_SIZE_LIMIT || currentBatch.size() >= m_batchSize) {
                     // roll to next batch
                     m_records.add(currentBatch);
                     m_currentBatchSize = 0;
                     currentBatch = new LinkedList<Record>();
                 }
                 currentBatch.add(record);
-                m_currentBatchSize += rowSize;
-            }else{
+                m_currentBatchSize += data.length;
+            }
+            else {
                 try {
                     m_sink.writeRow(record);
-                } catch (FirehoseExportException e) {
+                }
+                catch (FirehoseExportException e) {
                     throw new RestartBlockException("firehose write fault", e, true);
-                } catch (ResourceNotFoundException | InvalidArgumentException | ServiceUnavailableException e) {
+                }
+                catch (ResourceNotFoundException | InvalidArgumentException | ServiceUnavailableException e) {
                     LOG.error("Failed to send record batch", e);
                     throw new RestartBlockException("Failed to send record batch", e, true);
                 }
@@ -248,29 +255,33 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
         @Override
         public void sourceNoLongerAdvertised(AdvertisedDataSource source)
         {
-            if(m_sink != null){
+            if (m_sink != null) {
                 m_sink.shutDown();
             }
-            if (m_firehoseClient != null) m_firehoseClient.shutdown();
+            if (m_firehoseClient != null) {
+                m_firehoseClient.shutdown();
+            }
             m_es.shutdown();
             try {
                 m_es.awaitTermination(365, TimeUnit.DAYS);
-            } catch (InterruptedException e) {
+            }
+            catch (InterruptedException e) {
                 Throwables.propagate(e);
             }
         }
 
         @Override
-        public void onBlockStart() throws RestartBlockException
-        {
-            if (!m_primed) checkOnFirstRow();
+        public void onBlockStart(ExportRowData row) throws RestartBlockException {
+            if (!m_primed) {
+                checkOnFirstRow(row);
+            }
             m_records = new LinkedList<List<Record>>();
             m_currentBatchSize = 0;
             currentBatch = new LinkedList<Record>();
         }
 
         @Override
-        public void onBlockCompletion() throws RestartBlockException {
+        public void onBlockCompletion(ExportRowData row) throws RestartBlockException {
 
             if(m_batchMode){
                 // add last batch
@@ -282,14 +293,17 @@ public class KinesisFirehoseExportClient extends ExportClientBase {
                 }
 
                 try {
-                    if(m_concurrentWriter > 0){
+                    if (m_concurrentWriter > 0) {
                         m_sink.write(m_records);
-                    }else{
+                    }
+                    else {
                         m_sink.syncWrite(m_records);
                     }
-                } catch (FirehoseExportException e) {
+                }
+                catch (FirehoseExportException e) {
                     throw new RestartBlockException("firehose write fault", e, true);
-                } catch (ResourceNotFoundException | InvalidArgumentException | ServiceUnavailableException e) {
+                }
+                catch (ResourceNotFoundException | InvalidArgumentException | ServiceUnavailableException e) {
                     LOG.error("Failed to send record batch", e);
                     throw new RestartBlockException("Failed to send record batch", e, true);
                 }
